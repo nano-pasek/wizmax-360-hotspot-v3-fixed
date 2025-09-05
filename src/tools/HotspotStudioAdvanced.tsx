@@ -136,6 +136,60 @@ function snapToGridRGB(data: Uint8ClampedArray, step = 2) {
   }
 }
 
+// --- RGB -> Lab (CIE76) i deltaE ---
+function srgbToLinear(c: number) { c/=255; return c<=0.04045? c/12.92 : Math.pow((c+0.055)/1.055,2.4); }
+function linearToXyz(r: number, g: number, b: number) {
+  const x = r*0.4124 + g*0.3576 + b*0.1805;
+  const y = r*0.2126 + g*0.7152 + b*0.0722;
+  const z = r*0.0193 + g*0.1192 + b*0.9505;
+  return {x,y,z};
+}
+function xyzToLab(x: number, y: number, z: number) {
+  // D65
+  const X=0.95047, Y=1.00000, Z=1.08883;
+  let fx = x/X, fy = y/Y, fz = z/Z;
+  const f = (t: number)=> t>0.008856? Math.cbrt(t) : (7.787*t + 16/116);
+  fx=f(fx); fy=f(fy); fz=f(fz);
+  return { L: 116*fy - 16, a: 500*(fx-fy), b: 200*(fy-fz) };
+}
+function rgbToLab(r: number, g: number, b: number) {
+  const {x,y,z} = linearToXyz(srgbToLinear(r), srgbToLinear(g), srgbToLinear(b));
+  return xyzToLab(x,y,z);
+}
+function deltaE76(a: {L:number;a:number;b:number}, b: {L:number;a:number;b:number}) {
+  const dL=a.L-b.L, da=a.a-b.a, db=a.b-b.b;
+  return Math.hypot(dL,da,db);
+}
+const packRGB = (r:number,g:number,b:number)=> (r<<16)|(g<<8)|b;
+
+// --- Prosty grupownik kolorów w Lab (centroidy rosnące) ---
+class ColorGrouper {
+  centers: {L:number;a:number;b:number}[] = [];
+  repr: {r:number;g:number;b:number}[] = [];
+  cache = new Map<number, number>();
+  tol: number;
+  constructor(tol:number) {
+    this.tol = tol;
+  }
+  idForRGB(r:number,g:number,b:number) {
+    const key = packRGB(r,g,b);
+    const cached = this.cache.get(key); if (cached!=null) return cached;
+    const lab = rgbToLab(r,g,b);
+    for (let i=0;i<this.centers.length;i++){
+      const d = deltaE76(lab, this.centers[i]);
+      if (d<=this.tol){ this.cache.set(key,i); return i; }
+    }
+    // nowa grupa
+    this.centers.push(lab);
+    this.repr.push({r,g,b});
+    const id = this.centers.length-1;
+    this.cache.set(key,id);
+    return id;
+  }
+  idAtPixel(data:Uint8ClampedArray, i:number){ return this.idForRGB(data[i],data[i+1],data[i+2]); }
+  hexFor(id:number){ const c=this.repr[id]; return rgbToHex(c.r,c.g,c.b); }
+}
+
 // ==========================
 // Marching Squares: mask -> polygons
 // ==========================
@@ -237,6 +291,64 @@ function floodRegion(
   return { minX, minY, maxX, maxY, mask, bw, bh, pixelCount: pixels.length / 2 };
 }
 
+function floodRegionByGroup(
+  data: Uint8ClampedArray,
+  w: number, h: number,
+  sx: number, sy: number,
+  seedGroup: number,
+  grouper: ColorGrouper,
+  visited: Uint8Array
+): FloodResult | null {
+  const idx=(x:number,y:number)=>(y*w+x)*4;
+  const lin0=sy*w+sx;
+  if (visited[lin0]) return null;
+  if (grouper.idAtPixel(data, idx(sx,sy)) !== seedGroup) return null;
+
+  let minX=sx, maxX=sx, minY=sy, maxY=sy;
+  const stack:number[]=[sx,sy]; const pixels:number[]=[];
+  visited[lin0]=1;
+
+  while (stack.length){
+    const y=stack.pop()!, x=stack.pop()!;
+    pixels.push(x,y);
+    if (x<minX)minX=x; if (x>maxX)maxX=x; if (y<minY)minY=y; if (y>maxY)maxY=y;
+    for (let dy=-1; dy<=1; dy++) for (let dx=-1; dx<=1; dx++){
+      if (!dx && !dy) continue;
+      const nx=x+dx, ny=y+dy; if (nx<0||ny<0||nx>=w||ny>=h) continue;
+      const lin=ny*w+nx; if (visited[lin]) continue;
+      if (grouper.idAtPixel(data, idx(nx,ny)) === seedGroup){ visited[lin]=1; stack.push(nx,ny); }
+    }
+  }
+  const bw=maxX-minX+1, bh=maxY-minY+1;
+  const mask=new Uint8Array(bw*bh);
+  for (let i=0;i<pixels.length;i+=2){
+    const x=pixels[i]-minX, y=pixels[i+1]-minY; mask[y*bw+x]=1;
+  }
+  return {minX,minY,maxX,maxY,mask,bw,bh,pixelCount:pixels.length/2};
+}
+
+function morphClose1(mask: Uint8Array, w: number, h: number) {
+  // dilate 1px
+  const tmp = new Uint8Array(mask);
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++){
+    if (mask[y*w+x]) continue;
+    for (let dy=-1; dy<=1; dy++) for (let dx=-1; dx<=1; dx++){
+      const nx=x+dx, ny=y+dy; if (nx<0||ny<0||nx>=w||ny>=h) continue;
+      if (mask[ny*w+nx]) { tmp[y*w+x]=1; dy=2; break; }
+    }
+  }
+  // erode 1px
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++){
+    if (!tmp[y*w+x]) continue;
+    let keep=false;
+    for (let dy=-1; dy<=1; dy++) for (let dx=-1; dx<=1; dx++){
+      const nx=x+dx, ny=y+dy; if (nx<0||ny<0||nx>=w||ny>=h) continue;
+      if (tmp[ny*w+nx]) { keep=true; dy=2; break; }
+    }
+    mask[y*w+x] = keep ? 1 : 0;
+  }
+}
+
 // ==========================
 // IO: Image loading helper
 // ==========================
@@ -259,32 +371,8 @@ type Region = { color: string; points: [number, number][]; pixelArea: number; ma
 type FrameData = { w: number; h: number; url: string; regions: Region[] };
 
 // ==========================
-// Worker factory (Blob URL) – równoległe przeliczanie
+// (WebWorkers temporarily disabled for debugging)
 // ==========================
-
-function makeWorkerURL() {
-  // @ts-ignore
-  if (makeWorkerURL._url) return (makeWorkerURL as any)._url as string;
-  const src =
-    "self.onmessage=function(e){"+
-    "var w=e.data.w,h=e.data.h,buffer=e.data.buffer,minArea=e.data.minArea,epsilon=e.data.epsilon,tolerance=e.data.tolerance;"+
-    "var data=new Uint8ClampedArray(buffer);"+
-    // helpers
-    "function colorDist(a,b){return Math.max(Math.abs(a[0]-b[0]),Math.abs(a[1]-b[1]),Math.abs(a[2]-b[2]));}"+
-    "function rgbToHex(r,g,b){function hx(n){return n.toString(16).padStart(2,'0')}return ('#'+hx(r)+hx(g)+hx(b)).toUpperCase()}"+
-    "function rdp(points,eps){if(points.length<=2||eps<=0)return points.slice();var keep=new Array(points.length).fill(false);keep[0]=keep[points.length-1]=true;var st=[[0,points.length-1]];while(st.length){var p=st.pop();var s=p[0],e=p[1];var ax=points[s][0],ay=points[s][1],bx=points[e][0],by=points[e][1];var maxD=-1,idx=-1;var labx=bx-ax,laby=by-ay;var lab2=labx*labx+laby*laby||1e-12;for(var i=s+1;i<e;i++){var px=points[i][0],py=points[i][1];var t=((px-ax)*labx+(py-ay)*laby)/lab2;var qx=ax+t*labx,qy=ay+t*laby;var dx=px-qx,dy=py-qy;var d=Math.hypot(dx,dy);if(d>maxD){maxD=d;idx=i}}if(maxD>eps){keep[idx]=true;st.push([s,idx],[idx,e])}}var out=[];for(var i2=0;i2<points.length;i2++)if(keep[i2])out.push(points[i2]);return out;}"+
-    "function polygonArea(points){var a=0;for(var i=0,j=points.length-1;i<points.length;j=i++){a+=points[j][0]*points[i][1]-points[i][0]*points[j][1]}return a/2}"+
-    // marching squares (minimal)
-    "function tracePolygons(mask,bw,bh){var W=bw+1,H=bh+1;var corners=new Uint8Array(W*H);for(var y=1;y<H;y++){var my=(y-1)*bw;for(var x=1;x<W;x++)corners[y*W+x]=mask[my+(x-1)]?1:0}var segs=[];function push(ax,ay,bx,by){segs.push({a:{x:ax,y:ay},b:{x:bx,y:by}})}for(var y2=0;y2<bh;y2++){for(var x2=0;x2<bw;x2++){var tl=corners[y2*W+x2],tr=corners[y2*W+(x2+1)],br=corners[(y2+1)*W+(x2+1)],bl=corners[(y2+1)*W+x2];var code=(tl<<3)|(tr<<2)|(br<<1)|bl;if(code===0||code===15)continue;var top=[x2+0.5,y2],right=[x2+1,y2+0.5],bottom=[x2+0.5,y2+1],left=[x2,y2+0.5];switch(code){case 1:push(left[0],left[1],bottom[0],bottom[1]);break;case 2:push(bottom[0],bottom[1],right[0],right[1]);break;case 3:push(left[0],left[1],right[0],right[1]);break;case 4:push(top[0],top[1],right[0],right[1]);break;case 5:push(top[0],top[1],left[0],left[1]);push(bottom[0],bottom[1],right[0],right[1]);break;case 6:push(top[0],top[1],bottom[0],bottom[1]);break;case 7:push(top[0],top[1],left[0],left[1]);break;case 8:push(left[0],left[1],top[0],top[1]);break;case 9:push(bottom[0],bottom[1],top[0],top[1]);break;case 10:push(top[0],top[1],right[0],right[1]);push(left[0],left[1],bottom[0],bottom[1]);break;case 11:push(right[0],right[1],bottom[0],bottom[1]);break;case 12:push(left[0],left[1],right[0],right[1]);break;case 13:push(right[0],right[1],bottom[0],bottom[1]);break;case 14:push(left[0],left[1],bottom[0],bottom[1]);break;}}}var key=function(p){return Math.round(p.x*2)+'_'+Math.round(p.y*2)};var adj=new Map();for(var i3=0;i3<segs.length;i3++){var s=segs[i3];var ka=key(s.a),kb=key(s.b);if(!adj.has(ka))adj.set(ka,[]);if(!adj.has(kb))adj.set(kb,[]);adj.get(ka).push(s.b);adj.get(kb).push(s.a)}var visited=new Set();var polygons=[];for(const ent of adj){var kStart=ent[0],neigh=ent[1];if(visited.has(kStart)||neigh.length===0)continue;var currentKey=kStart;var parse=function(k){var sp=k.split('_');return {x:parseInt(sp[0],10)/2,y:parseInt(sp[1],10)/2}};var current=parse(kStart);var loop=[[current.x,current.y]];visited.add(kStart);var prevKey=null;while(true){var nbrs=adj.get(currentKey);var next=null;if(nbrs.length===1)next=nbrs[0];else if(nbrs.length>=2){var k0=key(nbrs[0]);next=prevKey===k0?nbrs[1]:nbrs[0]}if(!next)break;var nk=key(next);if(nk===kStart)break;if(visited.has(nk))break;loop.push([next.x,next.y]);visited.add(nk);prevKey=currentKey;currentKey=nk;current=next}if(loop.length>=3){if(polygonArea(loop)<0)loop.reverse();polygons.push(loop)}}return polygons;}"+
-    // flood region z tolerancją
-    "function floodRegion(data,w,h,sx,sy,color,tol,visited){var idx=function(x,y){return (y*w+x)*4};var i0=idx(sx,sy);var colAt=function(i){return [data[i],data[i+1],data[i+2]]};if(visited[sy*w+sx])return null;if(colorDist(colAt(i0),color)>tol)return null;var minX=sx,maxX=sx,minY=sy,maxY=sy;var stack=[sx,sy];var pixels=[];visited[sy*w+sx]=1;while(stack.length){var y=stack.pop(),x=stack.pop();pixels.push(x,y);if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;for(var dy=-1;dy<=1;dy++){for(var dx=-1;dx<=1;dx++){if(dx===0&&dy===0)continue;var nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;var lin=ny*w+nx;if(visited[lin])continue;var ci=idx(nx,ny);if(colorDist(colAt(ci),color)<=tol){visited[lin]=1;stack.push(nx,ny)}}}}var bw=maxX-minX+1,bh=maxY-minY+1;var mask=new Uint8Array(bw*bh);for(var i=0;i<pixels.length;i+=2){var xx=pixels[i]-minX,yy=pixels[i+1]-minY;mask[yy*bw+xx]=1}return {minX:minX,minY:minY,maxX:maxX,maxY:maxY,mask:mask,bw:bw,bh:bh,pixelCount:pixels.length/2}}"+
-    // main per-file z małą tolerancją dla tła, bez tolerancji dla flood-fill
-    "var visited=new Uint8Array(w*h);var d=data;var bg=[d[0],d[1],d[2]];for(var y=0;y<h;y++){var off=y*w*4;for(var x=0;x<w;x++){var i4=off+x*4;if(colorDist([d[i4],d[i4+1],d[i4+2]],bg)<=2)visited[y*w+x]=2}}var regions=[];var idx2=function(x,y){return (y*w+x)*4};var colAt2=function(i){return [d[i],d[i+1],d[i+2]]};for(var y2=0;y2<h;y2++){for(var x2=0;x2<w;x2++){var lin2=y2*w+x2;if(visited[lin2])continue;var c=colAt2(idx2(x2,y2));var res=floodRegion(d,w,h,x2,y2,c,0,visited);if(!res)continue;if(res.pixelCount<minArea)continue;var polysLocal=tracePolygons(res.mask,res.bw,res.bh);var hex=rgbToHex(c[0],c[1],c[2]);for(var p=0;p<polysLocal.length;p++){var pl=polysLocal[p];var poly=[];for(var k=0;k<pl.length;k++){poly.push([pl[k][0]+res.minX,pl[k][1]+res.minY])}var simp=rdp(poly,epsilon);regions.push({color:hex,points:simp,pixelArea:res.pixelCount})}}}postMessage({type:'done',regions:regions});";
-
-  const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
-  // @ts-ignore
-  makeWorkerURL._url = url; return url;
-}
 
 // ==========================
 // Main Component
@@ -300,6 +388,7 @@ export default function HotspotStudioAdvanced() {
   const [minArea, setMinArea] = useState<number>(1000);
   const [epsilon, setEpsilon] = useState<number>(0.8);
   const [tolerance, setTolerance] = useState<number>(10); // KLUCZ: tolerancja kolorów!
+  const [groupDeltaE, setGroupDeltaE] = useState<number>(10); // Grupowanie kolorów ΔE Lab
   const [loading, setLoading] = useState<string>("");
   const [minAngleDeg, setMinAngleDeg] = useState<number>(10);
   const [minEdgePx, setMinEdgePx] = useState<number>(2);
@@ -370,7 +459,6 @@ export default function HotspotStudioAdvanced() {
 
     // TYMCZASOWO: używaj tylko fallback dla debugowania
     let useWorkers = false;
-    let workerURL = "";
     let workers: Worker[] = [];
     
     console.log("🔧 Używam fallback na głównym wątku dla debugowania problemu");
@@ -444,114 +532,79 @@ export default function HotspotStudioAdvanced() {
           snapToGridRGB(d, 2);
           console.log("🔧 Zastosowano kwantyzację kolorów (step=2)");
           
-          // Ten sam algorytm co w Workerze, ale na głównym wątku
+          // Nowy algorytm z grupowaniem kolorów w Lab
           const visited = new Uint8Array(iw * ih);
           const bg: [number, number, number] = [d[0], d[1], d[2]];
-          console.log(`🎨 Kolor tła: RGB(${bg[0]}, ${bg[1]}, ${bg[2]}), tolerancja: ${tolerance}`);
+          console.log(`🎨 Kolor tła: RGB(${bg[0]}, ${bg[1]}, ${bg[2]}), grupowanie ΔE: ${groupDeltaE}`);
           
-          // Oznacz tło - używamy małej tolerancji tylko dla antyaliasingu tła
-          const bgTol = Math.min(2, tolerance); // 0..2 wystarczy na antyalias tła
+          // przed pętlami:
+          const grouper = new ColorGrouper(groupDeltaE);
+
+          // globalne maski dla grup (po nich policzymy kontury „raz na grupę")
+          const groupMasks: Uint8Array[] = []; // indeks = groupId
+
+          // tło – jak było (zostaw 0 tolerancji/==0)
           let bgPixels = 0;
-          for (let y = 0; y < ih; y++) {
-            const off = y * iw * 4;
-            for (let x = 0; x < iw; x++) {
-              const i4 = off + x * 4;
-              if (colorDist([d[i4], d[i4 + 1], d[i4 + 2]], bg) <= bgTol) {
-                visited[y * iw + x] = 2;
+          for (let y=0;y<ih;y++){
+            const off=y*iw*4;
+            for (let x=0;x<iw;x++){
+              const i4=off+x*4;
+              if (colorDist([d[i4],d[i4+1],d[i4+2]], bg)===0) {
+                visited[y*iw+x]=2;
                 bgPixels++;
               }
             }
           }
           console.log(`🌅 Oznaczono ${bgPixels} pikseli tła z ${iw * ih} (${((bgPixels / (iw * ih)) * 100).toFixed(1)}%)`);
-          
-          const regions: Region[] = [];
-          const idx = (x: number, y: number) => (y * iw + x) * 4;
-          const colAt = (i: number): [number, number, number] => [d[i], d[i + 1], d[i + 2]];
-          
-          // Znajdź regiony
-          let regionsFound = 0;
-          let pixelsProcessed = 0;
-          const totalPixels = iw * ih;
-          
-          console.log(`🔍 Rozpoczynam skanowanie ${totalPixels} pikseli...`);
-          
-          for (let y = 0; y < ih; y++) {
+
+          for (let y=0;y<ih;y++){
             // Loguj postęp co 10% wysokości
             if (y % Math.max(1, Math.floor(ih / 10)) === 0) {
-              console.log(`📊 Postęp: wiersz ${y}/${ih} (${((y/ih)*100).toFixed(1)}%)`);
+              console.log(`📊 Postęp grupowania: wiersz ${y}/${ih} (${((y/ih)*100).toFixed(1)}%)`);
             }
             
-            for (let x = 0; x < iw; x++) {
-              pixelsProcessed++;
-              const lin = y * iw + x;
-              if (visited[lin]) continue;
-              
-              const c = colAt(idx(x, y));
-              // Loguj tylko co 1000 nieprzetworzonych pikseli
-              if (pixelsProcessed % 1000 === 0) {
-                console.log(`🔍 Sprawdzam piksel (${x},${y}): RGB(${c[0]}, ${c[1]}, ${c[2]}) [${pixelsProcessed}/${totalPixels}]`);
-              }
-              
-              const region = floodRegion(d, iw, ih, x, y, c, 0, visited); // AUTO: bez tolerancji - dokładny kolor
-              if (!region) {
-                // Loguj tylko co 100 niepowodzeń
-                if (pixelsProcessed % 100 === 0) {
-                  console.log(`❌ Region null dla (${x},${y})`);
+            for (let x=0;x<iw;x++){
+              const lin=y*iw+x; if (visited[lin]) continue;
+
+              const seedGroup = grouper.idAtPixel(d, (y*iw+x)*4);
+              const res = floodRegionByGroup(d, iw, ih, x, y, seedGroup, grouper, visited);
+              if (!res || res.pixelCount < minArea) continue;
+
+              // OR-ujemy lokalną maskę do maski globalnej grupy
+              if (!groupMasks[seedGroup]) groupMasks[seedGroup] = new Uint8Array(iw*ih);
+              const gmask = groupMasks[seedGroup];
+              for (let yy=0; yy<res.bh; yy++){
+                for (let xx=0; xx<res.bw; xx++){
+                  if (res.mask[yy*res.bw+xx]) gmask[(res.minY+yy)*iw + (res.minX+xx)] = 1;
                 }
-                continue;
-              }
-              if (region.pixelCount < minArea) {
-                // Loguj tylko pierwsze 5 za małych regionów
-                if (regionsFound < 5) {
-                  console.log(`⚠️ Region za mały: ${region.pixelCount} < ${minArea}`);
-                }
-                continue;
-              }
-              
-              // Zabezpieczenie przed gigantycznymi regionami (ponad 50% obrazu)
-              const maxRegionSize = (iw * ih) * 0.5;
-              if (region.pixelCount > maxRegionSize) {
-                console.warn(`⚠️ Region za duży, pomijam: ${region.pixelCount} > ${maxRegionSize} (50% obrazu)`);
-                continue;
-              }
-              
-              regionsFound++;
-              console.log(`🎯 Region ${regionsFound}: kolor ${rgbToHex(c[0], c[1], c[2])}, pikseli: ${region.pixelCount}`);
-              
-              const polysLocal = tracePolygonsMarchingSquares(region.mask, region.bw, region.bh);
-              const hex = rgbToHex(c[0], c[1], c[2]);
-              
-              for (const pl of polysLocal) {
-                const poly: [number, number][] = pl.map(([px, py]) => [px + region.minX, py + region.minY]);
-                const simp = rdp(poly, epsilon);
-                regions.push({ color: hex, points: simp, pixelArea: region.pixelCount });
-              }
-              
-              // Przerwij jeśli za dużo regionów (zabezpieczenie)
-              if (regionsFound > 1000) {
-                console.warn(`⚠️ Przerwano po znalezieniu ${regionsFound} regionów (zabezpieczenie)`);
-                break;
               }
             }
-            if (regionsFound > 1000) break;
+            if ((y & 63)===0) await new Promise(requestAnimationFrame);
+          }
+
+          // Na końcu: raz na grupę liczymy kontury
+          const regions: Region[] = [];
+          console.log(`🎯 Przetwarzanie ${groupMasks.length} grup kolorów...`);
+          
+          for (let gid=0; gid<groupMasks.length; gid++){
+            const gmask = groupMasks[gid]; if (!gmask) continue;
+            
+            // Opcjonalne domknięcie 1px
+            morphClose1(gmask, iw, ih);
+            
+            const polys = tracePolygonsMarchingSquares(gmask, iw, ih);
+            for (const pl of polys){
+              const simp = simplifyClosedPolygon(pl, { epsilon, minAngle: minAngleDeg, minEdge: minEdgePx, mode: simplifyMode });
+              regions.push({ color: grouper.hexFor(gid), points: simp, pixelArea: 0 });
+            }
           }
           
-          console.log(`✅ Skanowanie zakończone: ${pixelsProcessed} pikseli, ${regionsFound} regionów`);
-          
-          console.log(`🎯 Znaleziono ${regionsFound} regionów przed simplify`);
-          
-          // angle-aware simplify
-          const simplified = regions.map(r => ({
-            ...r,
-            points: simplifyClosedPolygon(r.points, { epsilon, minAngle: minAngleDeg, minEdge: minEdgePx, mode: simplifyMode })
-          }));
-          
-          console.log(`✅ Po simplify: ${simplified.length} regionów`);
+          console.log(`✅ Grupowanie zakończone: ${regions.length} regionów`);
           
           outFrames.push(meta.frame);
-          outData[meta.frame] = { w: iw, h: ih, url, regions: simplified };
+          outData[meta.frame] = { w: iw, h: ih, url, regions };
           setProgDone(i + 1);
-          setLoading(`Gotowe: ${i + 1}/${files.length} • klatka ${meta.frame} • ${simplified.length} hs (fallback)`);
+          setLoading(`Gotowe: ${i + 1}/${files.length} • klatka ${meta.frame} • ${regions.length} hs (grupowanie)`);
         } catch (error) {
           console.error(`❌ Błąd przetwarzania ${f.name}:`, error);
           setLoading(`Błąd: ${f.name} - pomijam`);
@@ -693,7 +746,6 @@ export default function HotspotStudioAdvanced() {
   }
 
   // Pan/zoom + edycja
-  const [tooltip, setTooltip] = useState("");
 
   function onWheel(e: React.WheelEvent) {
     e.preventDefault();
@@ -761,6 +813,16 @@ export default function HotspotStudioAdvanced() {
             </select>
           </label>
           <label className="ml-2 text-yellow-400 font-semibold">Tolerancja <input type="number" step={1} className="ml-1 w-16 px-2 py-0.5 rounded bg-white/10" value={tolerance} onChange={e=>setTolerance(parseInt(e.target.value||"0"))} /></label>
+          <label className="ml-2">
+            Grupuj ΔE
+            <input
+              type="number"
+              step={1}
+              className="ml-1 w-16 px-2 py-0.5 rounded bg-white/10"
+              value={groupDeltaE}
+              onChange={(e) => setGroupDeltaE(parseInt(e.target.value || "0", 10))}
+            />
+          </label>
           <button className="ml-auto px-3 py-1 rounded bg-emerald-500/20 border border-emerald-400/40" onClick={processAll} disabled={!files.length}>Przelicz z tolerancją</button>
           <button className="px-3 py-1 rounded bg-white/10 border border-white/20" onClick={exportJSON} disabled={!frames.length}>Eksport JSON</button>
           <label className="px-2 py-1 rounded bg-white/10 border border-white/20 cursor-pointer">Wczytaj JSON
@@ -809,9 +871,10 @@ export default function HotspotStudioAdvanced() {
             <button className="px-2 py-1 rounded bg-emerald-500/20 border border-emerald-400/40" disabled={!legend.length || !idNumber} onClick={()=>{ if (selected != null && data) assignIdToColor(data.regions[selected].color, `${idPrefix}${idNumber}`); }}>Przypisz wybranemu</button>
           </div>
           <div className="text-[11px] opacity-70">Wskazówka: kliknij kolor w legendzie po prawej, aby go zaznaczyć, potem nadaj ID.</div>
-          <div className="mt-4 p-2 bg-yellow-500/10 border border-yellow-400/30 rounded">
-            <div className="text-yellow-400 text-[12px] font-semibold">Naprawiono: Inteligentna tolerancja!</div>
-            <div className="text-[11px] opacity-80 mt-1">Auto-przeliczanie: dokładne kolory (brak scalania). Tolerancja {tolerance} tylko dla magicznej różdżki i antyaliasingu tła.</div>
+          <div className="mt-4 p-2 bg-green-500/10 border border-green-400/30 rounded">
+            <div className="text-green-400 text-[12px] font-semibold">Nowe: Grupowanie kolorów ΔE Lab!</div>
+            <div className="text-[11px] opacity-80 mt-1">Auto-przeliczanie grupuje podobne kolory (ΔE={groupDeltaE}) w przestrzeni Lab, licząc kontury raz na grupę. Koniec z setkami małych regionów!</div>
+            <div className="text-[11px] opacity-70 mt-1">Różdżka: nadal używa tolerancji {tolerance} dla precyzyjnego klikania.</div>
           </div>
         </div>
 
@@ -912,7 +975,7 @@ export default function HotspotStudioAdvanced() {
               W trybie „edytuj węzły" możesz przeciągać węzły, klik na krawędzi dodaje punkt, Delete usuwa punkt.
             </div>
             <div className="text-[11px] opacity-70">
-              Tryb „różdżka" używa tolerancji {tolerance} dla precyzyjnego wykrywania kolorów z antyaliasingiem.
+              Grupowanie ΔE {groupDeltaE}: scala podobne kolory w przestrzeni Lab. Tryb „różdżka" używa tolerancji {tolerance}.
             </div>
           </div>
         </div>

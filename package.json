@@ -1,0 +1,40 @@
+{
+  "name": "wizmax-360-hotspot-v3-fixed",
+  "private": true,
+  "version": "1.1.20",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "accept": "git add . && git commit -m \"accept changes\" || echo no changes",
+    "release:patch": "node scripts/release.js patch",
+    "release:minor": "node scripts/release.js minor",
+    "release:major": "node scripts/release.js major",
+    "release:set": "node scripts/release.js set",
+    "goto:version": "node -e \"import('child_process').then(cp => { cp.execSync('git reset --hard ' + process.argv[1], {stdio:'inherit'}); cp.execSync('npm run dev', {stdio:'inherit'}); })\"",
+    "release:patch:push": "npm run release:patch && git push && git push --tags",
+    "release:minor:push": "npm run release:minor && git push && git push --tags",
+    "release:major:push": "npm run release:major && git push && git push --tags",
+    "release": "release-it",
+    "release:patch:it": "release-it patch",
+    "release:minor:it": "release-it minor",
+    "release:major:it": "release-it major",
+    "upload": "git push && git push --tags",
+    "upload:manual": "echo 'Wysyłanie wersji na GitHub...' && git push && git push --tags",
+    "versions": "node scripts/show-versions.js"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@release-it/conventional-changelog": "^10.0.1",
+    "@types/react": "^18.2.73",
+    "@types/react-dom": "^18.2.24",
+    "@vitejs/plugin-react": "^4.3.1",
+    "release-it": "^19.0.4",
+    "typescript": "^5.5.4",
+    "vite": "^4.5.3"
+  }
+}
